@@ -1,6 +1,4 @@
-use std::{slice, str};
-
-use async_std::io;
+use std::{io, slice, str};
 
 use crate::other;
 

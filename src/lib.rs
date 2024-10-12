@@ -24,7 +24,6 @@ use std::io::{Error, ErrorKind};
 
 pub use crate::{
     archive::{Archive, ArchiveBuilder, Entries},
-    builder::Builder,
     entry::{Entry, Unpacked},
     entry_type::EntryType,
     header::{
@@ -34,16 +33,11 @@ pub use crate::{
 };
 
 mod archive;
-mod builder;
 mod entry;
 mod entry_type;
 mod error;
 mod header;
 mod pax;
-
-#[cfg(test)]
-#[macro_use]
-extern crate static_assertions;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)

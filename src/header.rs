@@ -3,11 +3,13 @@ use std::os::unix::prelude::*;
 #[cfg(windows)]
 use std::os::windows::prelude::*;
 
-use std::{borrow::Cow, fmt, iter, iter::repeat, mem, str};
-
-use async_std::{
-    fs, io,
+use std::{
+    borrow::Cow,
+    fmt, fs, io, iter,
+    iter::repeat,
+    mem,
     path::{Component, Path, PathBuf},
+    str,
 };
 
 use crate::{other, EntryType};

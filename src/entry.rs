@@ -1,19 +1,23 @@
 use std::{
     borrow::Cow,
-    cmp, fmt, marker,
+    cmp, fmt,
+    fs::Permissions,
+    io::{Error, ErrorKind},
+    marker,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::PermissionsExt,
+    },
+    path::{Component, Path, PathBuf},
     pin::Pin,
     task::{Context, Poll},
 };
 
-use async_std::{
-    fs,
-    fs::OpenOptions,
-    io::{self, prelude::*, Error, ErrorKind, SeekFrom},
-    path::{Component, Path, PathBuf},
-};
-use pin_project::pin_project;
-
+use bytes::BytesMut;
 use filetime::{self, FileTime};
+use pin_project::pin_project;
+use tokio::io::{self, AsyncRead, AsyncReadExt, ReadBuf};
+use tokio_uring::fs;
 
 use crate::{
     error::TarError, header::bytes2path, other, pax::pax_extensions, Archive, Header, PaxExtensions,
@@ -25,13 +29,13 @@ use crate::{
 /// be inspected. It acts as a file handle by implementing the Reader trait. An
 /// entry cannot be rewritten once inserted into an archive.
 #[pin_project]
-pub struct Entry<R: Read + Unpin> {
+pub struct Entry<R: AsyncRead + Unpin> {
     #[pin]
     fields: EntryFields<R>,
     _ignored: marker::PhantomData<Archive<R>>,
 }
 
-impl<R: Read + Unpin> fmt::Debug for Entry<R> {
+impl<R: AsyncRead + Unpin> fmt::Debug for Entry<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Entry")
             .field("fields", &self.fields)
@@ -42,7 +46,7 @@ impl<R: Read + Unpin> fmt::Debug for Entry<R> {
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
 #[pin_project]
-pub struct EntryFields<R: Read + Unpin> {
+pub struct EntryFields<R: AsyncRead + Unpin> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,
     pub pax_extensions: Option<Vec<u8>>,
@@ -59,7 +63,7 @@ pub struct EntryFields<R: Read + Unpin> {
     pub(crate) read_state: Option<EntryIo<R>>,
 }
 
-impl<R: Read + Unpin> fmt::Debug for EntryFields<R> {
+impl<R: AsyncRead + Unpin> fmt::Debug for EntryFields<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EntryFields")
             .field("long_pathname", &self.long_pathname)
@@ -79,12 +83,12 @@ impl<R: Read + Unpin> fmt::Debug for EntryFields<R> {
 }
 
 #[pin_project(project = EntryIoProject)]
-pub enum EntryIo<R: Read + Unpin> {
+pub enum EntryIo<R: AsyncRead + Unpin> {
     Pad(#[pin] io::Take<io::Repeat>),
     Data(#[pin] io::Take<R>),
 }
 
-impl<R: Read + Unpin> fmt::Debug for EntryIo<R> {
+impl<R: AsyncRead + Unpin> fmt::Debug for EntryIo<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EntryIo::Pad(_) => write!(f, "EntryIo::Pad"),
@@ -105,7 +109,7 @@ pub enum Unpacked {
     Other,
 }
 
-impl<R: Read + Unpin> Entry<R> {
+impl<R: AsyncRead + Unpin> Entry<R> {
     /// Returns the path name for this entry.
     ///
     /// This method may fail if the pathname is not valid Unicode and this is
@@ -311,18 +315,18 @@ impl<R: Read + Unpin> Entry<R> {
     }
 }
 
-impl<R: Read + Unpin> Read for Entry<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for Entry<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        into: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        into: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let mut this = self.project();
         Pin::new(&mut *this.fields).poll_read(cx, into)
     }
 }
 
-impl<R: Read + Unpin> EntryFields<R> {
+impl<R: AsyncRead + Unpin> EntryFields<R> {
     pub fn from(entry: Entry<R>) -> Self {
         entry.fields
     }
@@ -343,7 +347,7 @@ impl<R: Read + Unpin> EntryFields<R> {
         let mut buf = Vec::with_capacity(cap as usize);
 
         // Copied from futures::ReadToEnd
-        match async_std::task::ready!(poll_read_all_internal(self, cx, &mut buf)) {
+        match std::task::ready!(poll_read_all_internal(self, cx, &mut buf)) {
             Ok(_) => Poll::Ready(Ok(buf)),
             Err(err) => Poll::Ready(Err(err)),
         }
@@ -490,8 +494,8 @@ impl<R: Read + Unpin> EntryFields<R> {
             Ok(()) => Ok(()),
             Err(err) => {
                 if err.kind() == ErrorKind::AlreadyExists {
-                    let prev = fs::metadata(dst).await;
-                    if prev.map(|m| m.is_dir()).unwrap_or(false) {
+                    let (is_dir, _) = fs::is_dir_regfile(dst).await;
+                    if is_dir {
                         return Ok(());
                     }
                 }
@@ -551,7 +555,7 @@ impl<R: Read + Unpin> EntryFields<R> {
                     }
                     None => src.into_owned(),
                 };
-                fs::hard_link(&link_src, dst).await.map_err(|err| {
+                tokio::fs::hard_link(&link_src, dst).await.map_err(|err| {
                     Error::new(
                         err.kind(),
                         format!(
@@ -563,7 +567,7 @@ impl<R: Read + Unpin> EntryFields<R> {
                     )
                 })?;
             } else {
-                symlink(&src, dst).await.map_err(|err| {
+                fs::symlink(&src, dst).await.map_err(|err| {
                     Error::new(
                         err.kind(),
                         format!(
@@ -576,22 +580,6 @@ impl<R: Read + Unpin> EntryFields<R> {
                 })?;
             };
             return Ok(Unpacked::Other);
-
-            #[cfg(target_arch = "wasm32")]
-            #[allow(unused_variables)]
-            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
-            }
-
-            #[cfg(windows)]
-            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                async_std::os::windows::fs::symlink_file(src, dst).await
-            }
-
-            #[cfg(any(unix, target_os = "redox"))]
-            async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                async_std::os::unix::fs::symlink(src, dst).await
-            }
         } else if kind.is_pax_global_extensions()
             || kind.is_pax_local_extensions()
             || kind.is_gnu_longname()
@@ -623,14 +611,14 @@ impl<R: Read + Unpin> EntryFields<R> {
         // Ensure we write a new file rather than overwriting in-place which
         // is attackable; if an existing file is found unlink it.
         async fn open(dst: &Path) -> io::Result<fs::File> {
-            OpenOptions::new()
+            fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(dst)
                 .await
         }
         let mut f = async {
-            let mut f = match open(dst).await {
+            let f = match open(dst).await {
                 Ok(f) => Ok(f),
                 Err(err) => {
                     if err.kind() == ErrorKind::AlreadyExists {
@@ -644,19 +632,31 @@ impl<R: Read + Unpin> EntryFields<R> {
                     }
                 }
             }?;
+            let mut offset = 0;
+            let mut read_buf = BytesMut::zeroed(1 * 1024 * 1024);
             for io in self.data.drain(..) {
                 match io {
                     EntryIo::Data(mut d) => {
                         let expected = d.limit();
-                        if io::copy(&mut d, &mut f).await? != expected {
-                            return Err(other("failed to write entire file"));
+                        let mut bytes_written = 0;
+                        while bytes_written < expected {
+                            let bytes_read = d.read(&mut read_buf).await?;
+                            if bytes_read == 0 {
+                                return Err(other("expected more bytes from stream"));
+                            }
+                            let remaining = read_buf.split_off(bytes_read);
+                            let (res, mut buf) = f.write_all_at(read_buf, offset).await;
+                            res?;
+                            offset += bytes_read as u64;
+                            bytes_written += bytes_read as u64;
+                            buf.unsplit(remaining);
+                            read_buf = buf;
                         }
                     }
                     EntryIo::Pad(d) => {
-                        // TODO: checked cast to i64
-                        let to = SeekFrom::Current(d.limit() as i64);
-                        let size = f.seek(to).await?;
-                        f.set_len(size).await?;
+                        f.fallocate(offset, d.limit(), libc::FALLOC_FL_ZERO_RANGE)
+                            .await?;
+                        offset += d.limit();
                     }
                 }
             }
@@ -710,60 +710,28 @@ impl<R: Read + Unpin> EntryFields<R> {
             })
         }
 
-        #[cfg(any(unix, target_os = "redox"))]
         async fn _set_perms(
             dst: &Path,
             f: Option<&mut fs::File>,
             mode: u32,
             preserve: bool,
         ) -> io::Result<()> {
-            use std::os::unix::prelude::*;
-
             let mode = if preserve { mode } else { mode & 0o777 };
-            let perm = fs::Permissions::from_mode(mode as _);
-            match f {
-                Some(f) => f.set_permissions(perm).await,
-                None => fs::set_permissions(dst, perm).await,
-            }
-        }
-
-        #[cfg(windows)]
-        async fn _set_perms(
-            dst: &Path,
-            f: Option<&mut fs::File>,
-            mode: u32,
-            _preserve: bool,
-        ) -> io::Result<()> {
-            if mode & 0o200 == 0o200 {
-                return Ok(());
-            }
+            let perm = Permissions::from_mode(mode as _);
             match f {
                 Some(f) => {
-                    let mut perm = f.metadata().await?.permissions();
-                    perm.set_readonly(true);
-                    f.set_permissions(perm).await
+                    let tokio_file = unsafe { tokio::fs::File::from_raw_fd(f.as_raw_fd()) };
+                    tokio_file.set_permissions(perm).await?;
+                    let std_file = tokio_file.try_into_std().expect("no operation in flight");
+                    std::mem::forget(std_file);
+                    Ok(())
                 }
-                None => {
-                    let mut perm = fs::metadata(dst).await?.permissions();
-                    perm.set_readonly(true);
-                    fs::set_permissions(dst, perm).await
-                }
+                None => tokio::fs::set_permissions(dst, perm).await,
             }
         }
 
-        #[cfg(target_arch = "wasm32")]
-        #[allow(unused_variables)]
-        async fn _set_perms(
-            dst: &Path,
-            f: Option<&mut fs::File>,
-            mode: u32,
-            _preserve: bool,
-        ) -> io::Result<()> {
-            Err(io::Error::new(io::ErrorKind::Other, "Not implemented"))
-        }
-
-        #[cfg(all(unix, feature = "xattr"))]
-        async fn set_xattrs<R: Read + Unpin>(
+        #[cfg(feature = "xattr")]
+        async fn set_xattrs<R: AsyncRead + Unpin>(
             me: &mut EntryFields<R>,
             dst: &Path,
         ) -> io::Result<()> {
@@ -804,23 +772,18 @@ impl<R: Read + Unpin> EntryFields<R> {
 
             Ok(())
         }
-        // Windows does not completely support posix xattrs
-        // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
-        #[cfg(any(
-            windows,
-            target_os = "redox",
-            not(feature = "xattr"),
-            target_arch = "wasm32"
-        ))]
-        async fn set_xattrs<R: Read + Unpin>(_: &mut EntryFields<R>, _: &Path) -> io::Result<()> {
-            Ok(())
-        }
     }
 
     async fn ensure_dir_created(&self, dst: &Path, dir: &Path) -> io::Result<()> {
         let mut ancestor = dir;
         let mut dirs_to_create = Vec::new();
-        while ancestor.symlink_metadata().await.is_err() {
+        while fs::StatxBuilder::new()
+            .flags(libc::AT_SYMLINK_NOFOLLOW)
+            .pathname(ancestor)?
+            .statx()
+            .await
+            .is_err()
+        {
             dirs_to_create.push(ancestor);
             if let Some(parent) = ancestor.parent() {
                 ancestor = parent;
@@ -839,13 +802,13 @@ impl<R: Read + Unpin> EntryFields<R> {
 
     async fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
         // Abort if target (canonical) parent is outside of `dst`
-        let canon_parent = file_dst.canonicalize().await.map_err(|err| {
+        let canon_parent = file_dst.canonicalize().map_err(|err| {
             Error::new(
                 err.kind(),
                 format!("{} while canonicalizing {}", err, file_dst.display()),
             )
         })?;
-        let canon_target = dst.canonicalize().await.map_err(|err| {
+        let canon_target = dst.canonicalize().map_err(|err| {
             Error::new(
                 err.kind(),
                 format!("{} while canonicalizing {}", err, dst.display()),
@@ -866,12 +829,12 @@ impl<R: Read + Unpin> EntryFields<R> {
     }
 }
 
-impl<R: Read + Unpin> Read for EntryFields<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for EntryFields<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        into: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        into: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let mut this = self.project();
         loop {
             if this.read_state.is_none() {
@@ -886,15 +849,15 @@ impl<R: Read + Unpin> Read for EntryFields<R> {
             if let Some(ref mut io) = &mut *this.read_state {
                 let ret = Pin::new(io).poll_read(cx, into);
                 match ret {
-                    Poll::Ready(Ok(0)) => {
+                    Poll::Ready(Ok(())) if into.filled().len() == 0 => {
                         *this.read_state = None;
                         if this.data.as_ref().is_empty() {
-                            return Poll::Ready(Ok(0));
+                            return Poll::Ready(Ok(()));
                         }
                         continue;
                     }
-                    Poll::Ready(Ok(val)) => {
-                        return Poll::Ready(Ok(val));
+                    Poll::Ready(Ok(())) => {
+                        return Poll::Ready(Ok(()));
                     }
                     Poll::Ready(Err(err)) => {
                         return Poll::Ready(Err(err));
@@ -905,17 +868,17 @@ impl<R: Read + Unpin> Read for EntryFields<R> {
                 }
             }
             // Unable to pull another value from `data`, so we are done.
-            return Poll::Ready(Ok(0));
+            return Poll::Ready(Ok(()));
         }
     }
 }
 
-impl<R: Read + Unpin> Read for EntryIo<R> {
+impl<R: AsyncRead + Unpin> AsyncRead for EntryIo<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        into: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
+        into: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         match self.project() {
             EntryIoProject::Pad(io) => io.poll_read(cx, into),
             EntryIoProject::Data(io) => io.poll_read(cx, into),
@@ -936,7 +899,7 @@ impl Drop for Guard<'_> {
     }
 }
 
-fn poll_read_all_internal<R: Read + ?Sized>(
+fn poll_read_all_internal<R: AsyncRead + ?Sized>(
     mut rd: Pin<&mut R>,
     cx: &mut Context<'_>,
     buf: &mut Vec<u8>,
@@ -958,12 +921,14 @@ fn poll_read_all_internal<R: Read + ?Sized>(
             }
         }
 
-        match async_std::task::ready!(rd.as_mut().poll_read(cx, &mut g.buf[g.len..])) {
-            Ok(0) => {
+        let mut buf = ReadBuf::new(&mut g.buf[g.len..]);
+
+        match std::task::ready!(rd.as_mut().poll_read(cx, &mut buf)) {
+            Ok(()) if buf.filled().len() == 0 => {
                 ret = Poll::Ready(Ok(g.len));
                 break;
             }
-            Ok(n) => g.len += n,
+            Ok(()) => g.len += buf.filled().len(),
             Err(e) => {
                 ret = Poll::Ready(Err(e));
                 break;
